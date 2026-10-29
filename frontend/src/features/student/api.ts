@@ -183,6 +183,12 @@ export const useJoinClass = () => {
 /*  Submit Assignment                                                 */
 /* ------------------------------------------------------------------ */
 
+export const deleteSubmission = async (
+  submissionId: string
+): Promise<void> => {
+  await apiClient.delete(`/submissions/${submissionId}`);
+};
+
 export const submitAssignment = async (
   assignmentId: string,
   file: File
@@ -221,6 +227,52 @@ export const useSubmitAssignment = () => {
       queryClient.invalidateQueries({
         queryKey: ["submission", variables.assignmentId],
       });
+    },
+  });
+};
+
+export const useReplaceSubmission = (defaultStudentId?: string | null) => {
+  const queryClient = useQueryClient();
+
+  const invalidate = (variables?: {
+    assignmentId: string;
+    studentId?: string | null;
+  }) => {
+    if (!variables) return;
+    const sid =
+      variables.studentId !== undefined ? variables.studentId : defaultStudentId;
+    queryClient.invalidateQueries({
+      queryKey: ["submission", variables.assignmentId],
+    });
+    if (sid !== undefined) {
+      queryClient.invalidateQueries({
+        queryKey: ["submission", variables.assignmentId, sid],
+      });
+    }
+    queryClient.invalidateQueries({
+      queryKey: ["submissions", variables.assignmentId],
+    });
+  };
+
+  return useMutation({
+    mutationFn: async ({
+      assignmentId,
+      submissionId,
+      file,
+    }: {
+      assignmentId: string;
+      submissionId: string;
+      file: File;
+      studentId?: string | null;
+    }) => {
+      await deleteSubmission(submissionId);
+      return submitAssignment(assignmentId, file);
+    },
+    onSuccess: (_, variables) => {
+      invalidate(variables);
+    },
+    onError: (_, variables) => {
+      invalidate(variables);
     },
   });
 };

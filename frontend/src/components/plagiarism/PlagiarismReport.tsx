@@ -69,7 +69,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === "object" && value !== null;
 };
 
-const normalizePercent = (value: unknown): number => {
+export const normalizePercent = (value: unknown): number => {
   const num = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(num)) return 0;
   const percent = num <= 1 ? num * 100 : num;

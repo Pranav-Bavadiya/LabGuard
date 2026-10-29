@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 
 from .mongodb import get_database
 
@@ -26,4 +26,8 @@ async def ensure_indexes() -> None:
     )
     await db["reports"].create_index(
         [("created_at", ASCENDING)], name="reports_created_at_idx"
+    )
+    await db["reports"].create_index(
+        [("assignment_id", ASCENDING), ("generated_at", DESCENDING)],
+        name="reports_assignment_generated_idx",
     )

@@ -29,6 +29,9 @@ class ReportRepository:
         results: dict,
         average_similarity: float = 0.0,
         max_similarity: float = 0.0,
+        input_fingerprint: str | None = None,
+        submission_count: int | None = None,
+        document_count: int | None = None,
     ) -> dict:
         """Create a new report."""
         db = get_database()
@@ -42,6 +45,9 @@ class ReportRepository:
             "max_similarity": max_similarity,
             "generated_at": datetime.utcnow(),
             "is_published": False,
+            "input_fingerprint": input_fingerprint,
+            "submission_count": submission_count,
+            "document_count": document_count,
         }
 
         result = await collection.insert_one(report_data)
@@ -103,6 +109,29 @@ class ReportRepository:
         if report:
             return self._serialize_report(report)
         return report
+
+    async def get_latest_report_meta(self, assignment_id: str) -> Optional[dict]:
+        """Get metadata of the latest report for an assignment (excluding results)."""
+        db = get_database()
+        collection = db[self.collection_name]
+        doc = await collection.find_one(
+            {"assignment_id": assignment_id},
+            projection={"results": 0},
+            sort=[("generated_at", -1)],
+        )
+        return self._serialize_report(doc) if doc else None
+
+    async def list_report_summaries(self, assignment_id: str) -> list[dict]:
+        """List report summaries for an assignment without results (latest first)."""
+        db = get_database()
+        collection = db[self.collection_name]
+
+        reports = []
+        async for doc in collection.find(
+            {"assignment_id": assignment_id}, {"results": 0}
+        ).sort("generated_at", -1):
+            reports.append(self._serialize_report(doc))
+        return reports
 
     async def publish_latest_report(self, assignment_id: str) -> Optional[dict]:
         """Publish latest report for an assignment and return updated document."""

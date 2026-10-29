@@ -27,6 +27,8 @@ export type DetectionJob = {
   assignment_id?: string;
   status: "starting" | "processing" | "completed" | "failed" | string;
   report_id?: string | null;
+  reused?: boolean;
+  generated_at?: string | null;
   created_at?: string;
   updated_at?: string;
 };
@@ -176,9 +178,13 @@ export const fetchSubmissions = async (assignmentId: string): Promise<Submission
   return (res.data.data ?? []).map(mapSubmission);
 };
 
-export const runPlagiarismCheck = async (assignmentId: string): Promise<DetectionJob> => {
+export const runPlagiarismCheck = async (
+  assignmentId: string,
+  force = false
+): Promise<DetectionJob> => {
   const res = await apiClient.post<ApiEnvelope<DetectionJob>>(`/detection/run`, {
     assignment_id: assignmentId,
+    force,
   });
   return res.data.data;
 };
@@ -189,19 +195,12 @@ export const getDetectionJob = async (jobId: string): Promise<DetectionJob> => {
   }
 
   try {
-    console.log("[plagiarism] Fetching detection job status", { jobId });
-    const res = await apiClient.get<DetectionJobStatusResponse>(`/detection/jobs/${jobId}`,{ timeout: 16000 });
+    const res = await apiClient.get<DetectionJobStatusResponse>(`/detection/jobs/${jobId}`, { timeout: 30000 });
     const job = res.data.data;
 
     if (!job?.job_id) {
       throw new Error("Detection job response did not include a job_id");
     }
-
-    console.log("[plagiarism] Detection job status received", {
-      jobId,
-      status: job.status,
-      reportId: job.report_id,
-    });
 
     return job;
   } catch (error) {
@@ -212,57 +211,46 @@ export const getDetectionJob = async (jobId: string): Promise<DetectionJob> => {
   }
 };
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-export const pollDetectionJob = async (
-  jobId: string,
-  options?: { onUpdate?: (status: string) => void }
-): Promise<DetectionJob> => {
-  if (!jobId || !jobId.trim()) {
-    throw new Error("A valid detection job ID is required");
+export const getStoredJobId = (assignmentId: string): string | null => {
+  if (typeof window === "undefined" || !assignmentId) return null;
+  try {
+    return sessionStorage.getItem(`labguard:detectionJob:${assignmentId}`);
+  } catch {
+    return null;
   }
-
-  const maxRetries = 40;
-  const intervalMs = 5000;
-
-  console.log("[plagiarism] Polling detection job until completion", {
-    jobId,
-    maxRetries,
-    intervalMs,
-  });
-
-  for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-    console.log("[plagiarism] Polling detection job status", { jobId, attempt });
-
-    const job = await getDetectionJob(jobId);
-    const status = String(job.status ?? "").toLowerCase();
-    options?.onUpdate?.(status);
-    console.log("Job status:", job.status);
-
-    console.log("[plagiarism] Polled detection job status", {
-      jobId,
-      attempt,
-      status,
-      reportId: job.report_id,
-    });
-
-    if (status === "completed") {
-      console.log("[plagiarism] Detection job completed", { jobId, attempt });
-      return job;
-    }
-
-    if (status === "failed") {
-      throw new Error("Plagiarism detection failed");
-    }
-
-    if (attempt < maxRetries) {
-      await delay(intervalMs);
-    }
-  }
-
-  console.error("[plagiarism] Detection job polling timed out", { jobId, maxRetries });
-  throw new Error("Detection timed out. Please try again.");
 };
+
+export const setStoredJobId = (assignmentId: string, jobId: string): void => {
+  if (typeof window === "undefined" || !assignmentId || !jobId) return;
+  try {
+    sessionStorage.setItem(`labguard:detectionJob:${assignmentId}`, jobId);
+  } catch {}
+};
+
+export const clearStoredJobId = (assignmentId: string): void => {
+  if (typeof window === "undefined" || !assignmentId) return;
+  try {
+    sessionStorage.removeItem(`labguard:detectionJob:${assignmentId}`);
+  } catch {}
+};
+
+export const useDetectionJob = (jobId: string | null) =>
+  useQuery({
+    queryKey: ["detectionJob", jobId],
+    queryFn: () => getDetectionJob(jobId as string),
+    enabled: Boolean(jobId),
+    retry: (failureCount, error) => failureCount < 3 && !/not found/i.test(error.message),
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 5000),
+    staleTime: 0,
+    gcTime: 0,
+    refetchInterval: (query) => {
+      if (query.state.status === "error") return false;
+      const status = String(query.state.data?.status ?? "").toLowerCase();
+      if (status === "completed" || status === "failed") return false;
+      return 3000;
+    },
+    refetchIntervalInBackground: true,
+  });
 
 export const fetchAssignmentReports = async (assignmentId: string): Promise<AssignmentReport[]> => {
   const res = await apiClient.get<ApiEnvelope<AssignmentReport[]>>(
@@ -301,6 +289,31 @@ export const getLatestReport = <T extends { generated_at?: string | null }>(repo
     return bTime - aTime;
   });
   return sorted[0];
+};
+
+export const parseServerDate = (v?: string | null): Date | null => {
+  if (!v) return null;
+  const hasTz = /(Z|[+-]\d{2}:\d{2})$/.test(v);
+  const d = new Date(hasTz ? v : `${v}Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+export const isReportUpToDate = (
+  report: { generated_at?: string | null; documents?: unknown[] } | undefined,
+  submissions: Submission[]
+): boolean => {
+  if (!report) return false;
+  const generatedAt = parseServerDate(report.generated_at ?? null);
+  if (!generatedAt) return false;
+  const current = submissions.filter(
+    (s) => (s.status === "submitted" || s.status === "processing") && s.documentId
+  );
+  // anything submitted after the report was generated (unknown time counts as changed)
+  if (current.some((s) => { const t = parseServerDate(s.submittedAt ?? null); return !t || t > generatedAt; })) return false;
+  // a document that was compared in the report has since been removed
+  const currentIds = new Set(current.map((s) => String(s.documentId)));
+  if ((report.documents ?? []).map(String).some((id) => !currentIds.has(id))) return false;
+  return true;
 };
 
 export interface CourseStudent {
@@ -439,24 +452,14 @@ export const useDeleteAssignment = () => {
 };
 
 export const useRunPlagiarism = () => {
-  const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (assignmentId: string) => runPlagiarismCheck(assignmentId),
-    onSuccess: (data, assignmentId) => {
-      if (data && typeof data === "object" && Array.isArray((data as AssignmentReport).matrix)) {
-        queryClient.setQueryData<AssignmentReport[] | undefined>(
-          ["assignmentReports", assignmentId],
-          (current) => {
-            const reports = Array.isArray(current) ? current : [];
-            const nextReport = data as AssignmentReport;
-            const filtered = reports.filter((report) => report.report_id !== nextReport.report_id);
-            return [nextReport, ...filtered];
-          }
-        );
-      }
-
-      queryClient.invalidateQueries({ queryKey: ["assignmentReports", assignmentId] });
-    },
+    mutationFn: ({
+      assignmentId,
+      force,
+    }: {
+      assignmentId: string;
+      force?: boolean;
+    }) => runPlagiarismCheck(assignmentId, force),
     onError: (error) => {
       console.error("Failed to run plagiarism check:", error);
     },

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import anyio.to_thread
@@ -13,6 +14,9 @@ from ..repositories.detection_repository import DetectionRepository
 
 logger = logging.getLogger(__name__)
 
+# Bump this whenever detection logic or settings change so old reports stop being reused
+DETECTION_VERSION = "1"
+
 
 class DetectionOrchestrationService:
     """Orchestrate plagiarism detection pipeline for assignments."""
@@ -24,13 +28,38 @@ class DetectionOrchestrationService:
         self.document_service = DocumentManagementService()
         self.detector = PlagiarismDetector(PlagiarismConfig())
 
-    async def start_detection(self, assignment_id: str) -> dict:
-        """Create a detection job that can be processed in the background."""
+    @staticmethod
+    def _fingerprint(submissions: list[dict]) -> str:
+        doc_ids = sorted(
+            str(s["document_id"]) for s in submissions if s.get("document_id")
+        )
+        return hashlib.sha256(
+            (f"{'|'.join(doc_ids)}||{DETECTION_VERSION}").encode("utf-8")
+        ).hexdigest()
+
+    async def start_detection(self, assignment_id: str, force: bool = False) -> dict:
+        """Create a detection job that can be processed in the background, or reuse existing report."""
+        submissions = await self.submission_repo.list_assignment_submissions(assignment_id)
+        if not force and len(submissions) >= 2:
+            latest = await self.report_repo.get_latest_report_meta(assignment_id)
+            if latest and latest.get("input_fingerprint") == self._fingerprint(submissions):
+                job = await self.detection_repo.create_detection_job(assignment_id, "completed")
+                await self.detection_repo.update_detection_job(job["id"], "completed", latest["report_id"])
+                return {
+                    "job_id": job["id"],
+                    "assignment_id": assignment_id,
+                    "status": "completed",
+                    "report_id": latest["report_id"],
+                    "reused": True,
+                    "generated_at": latest.get("generated_at"),
+                }
+
         job = await self.detection_repo.create_detection_job(assignment_id, "starting")
         return {
             "job_id": job["id"],
             "assignment_id": assignment_id,
             "status": "starting",
+            "reused": False,
         }
 
     async def run_detection_job(self, job_id: str, assignment_id: str) -> None:
@@ -154,6 +183,9 @@ class DetectionOrchestrationService:
                     detection_results
                 ),
                 max_similarity=self._calculate_max_similarity(detection_results),
+                input_fingerprint=self._fingerprint(submissions),
+                submission_count=len(submissions),
+                document_count=len(detection_results),
             )
 
             logger.info(

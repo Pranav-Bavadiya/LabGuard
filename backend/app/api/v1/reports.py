@@ -139,6 +139,63 @@ async def publish_assignment_reports(
     }
 
 
+async def _require_assignment_teacher(
+    assignment_id: str,
+    credentials: HTTPAuthorizationCredentials,
+) -> tuple[str, str]:
+    requester_id, role = await _get_requester_context(credentials)
+    if role not in {"teacher", "admin"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Only teacher or admin can access reports",
+        )
+
+    assignment = await assignment_service.get_assignment(assignment_id)
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    class_doc = await class_service.get_class(assignment.get("class_id", ""))
+    if not class_doc:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    if role == "teacher" and class_doc.get("teacher_id") != requester_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to access reports for this assignment",
+        )
+
+    return requester_id, role
+
+
+@router.get(
+    "/assignments/{assignment_id}/reports/history", status_code=status.HTTP_200_OK
+)
+async def get_report_history(
+    assignment_id: str,
+    credentials: HTTPAuthorizationCredentials = Depends(_require_auth_credentials),
+) -> dict:
+    await _require_assignment_teacher(assignment_id, credentials)
+    return {
+        "message": "Report history retrieved",
+        "data": await report_service.list_report_history(assignment_id),
+    }
+
+
+@router.get(
+    "/assignments/{assignment_id}/reports/{report_id}", status_code=status.HTTP_200_OK
+)
+async def get_single_report(
+    assignment_id: str,
+    report_id: str,
+    credentials: HTTPAuthorizationCredentials = Depends(_require_auth_credentials),
+) -> dict:
+    await _require_assignment_teacher(assignment_id, credentials)
+    formatted = await report_service.get_formatted_report(assignment_id, report_id)
+    if not formatted:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {"message": "Report retrieved", "data": formatted}
+
+
 @router.get("/{report_id}/matches", status_code=status.HTTP_200_OK)
 async def get_report_matches(report_id: str) -> dict:
     result = await report_service.get_report_matches(report_id)

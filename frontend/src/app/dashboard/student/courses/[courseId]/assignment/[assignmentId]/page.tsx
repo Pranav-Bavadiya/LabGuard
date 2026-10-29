@@ -3,29 +3,62 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import { Loader2, ArrowLeft, Upload, FileCheck, Calendar, Info, Clock, CheckCircle2, AlertCircle, Eye } from "lucide-react";
-import { useStudentCourse } from "@/features/student/api";
-import { useAssignment } from "@/features/teacher/api"; // Reuse teacher query to avoid duplication
-import { useSubmitAssignment, useStudentSubmission } from "@/features/student/api";
+import {
+  useStudentCourse,
+  useSubmitAssignment,
+  useStudentSubmission,
+  useReplaceSubmission,
+} from "@/features/student/api";
+import { useAssignment, parseServerDate } from "@/features/teacher/api";
 import { useAuthStore } from "@/store/authStore";
 import { toast } from "sonner";
+
+const ALLOWED_FILE_TYPES = [
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain",
+];
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 
 export default function StudentAssignmentPage() {
   const { courseId, assignmentId } = useParams() as { courseId: string; assignmentId: string };
   const router = useRouter();
   const user = useAuthStore((s) => s.user);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isReplacing, setIsReplacing] = useState(false);
 
   const { data: course, isLoading: loadingCourse } = useStudentCourse(courseId);
   const { data: assignment, isLoading: loadingAssignment } = useAssignment(assignmentId);
   const { data: submission, isLoading: loadingSubmission } = useStudentSubmission(assignmentId, user?.id ?? null);
 
   const { mutate: submit, isPending: submitting } = useSubmitAssignment();
+  const { mutate: replace, isPending: replacing } = useReplaceSubmission(user?.id ?? null);
+
+  const validateFile = (file: File | null): file is File => {
+    if (!file) {
+      toast.error("Please select a file");
+      return false;
+    }
+    if (!ALLOWED_FILE_TYPES.includes(file.type)) {
+      toast.error("Only PDF, DOCX, and TXT files are allowed");
+      return false;
+    }
+    if (file.size === 0) {
+      toast.error("File cannot be empty");
+      return false;
+    }
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      toast.error("File size cannot exceed 10MB");
+      return false;
+    }
+    return true;
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
-      if (file.type !== "application/pdf") {
-        toast.error("Only PDF files are allowed");
+      if (!validateFile(file)) {
+        e.target.value = "";
         return;
       }
       setSelectedFile(file);
@@ -34,8 +67,10 @@ export default function StudentAssignmentPage() {
 
   const handleSubmit = () => {
     if (!selectedFile) return;
+    if (!validateFile(selectedFile)) return;
 
-    submit({assignmentId, file: selectedFile },
+    submit(
+      { assignmentId, file: selectedFile },
       {
         onSuccess: () => {
           toast.success("Assignment submitted successfully!");
@@ -43,6 +78,34 @@ export default function StudentAssignmentPage() {
         },
         onError: (error) => {
           toast.error(error instanceof Error ? error.message : "Failed to submit assignment");
+        },
+      }
+    );
+  };
+
+  const handleReplaceSubmit = () => {
+    if (!selectedFile) return;
+    if (!submission?.id) return;
+    if (!validateFile(selectedFile)) return;
+
+    replace(
+      {
+        assignmentId,
+        submissionId: submission.id as string,
+        file: selectedFile,
+      },
+      {
+        onSuccess: () => {
+          toast.success("Submission replaced");
+          setSelectedFile(null);
+          setIsReplacing(false);
+        },
+        onError: (error) => {
+          toast.error(
+            error instanceof Error && error.message
+              ? error.message
+              : "Failed to replace submission. Please upload again."
+          );
         },
       }
     );
@@ -74,7 +137,9 @@ export default function StudentAssignmentPage() {
     );
   }
 
-  const isOverdue = assignment.dueDate && new Date() > new Date(assignment.dueDate);
+  const parsedDueDate = parseServerDate(assignment.dueDate) ?? (assignment.dueDate ? new Date(assignment.dueDate) : null);
+  const isOverdue = Boolean(parsedDueDate && !Number.isNaN(parsedDueDate.getTime()) && new Date() > parsedDueDate);
+  const canReplace = Boolean(submission && !isOverdue && submission.id);
 
   return (
     <div className="max-w-4xl mx-auto space-y-8">
@@ -156,22 +221,94 @@ export default function StudentAssignmentPage() {
                   <div>
                     <p className="text-sm font-bold text-slate-900 dark:text-white">Submission Received</p>
                     <p className="text-xs text-slate-500 dark:text-slate-400">
-                      Logged on {new Date(submission.submittedAt!).toLocaleString()}
+                      Last submitted on {parseServerDate(submission.submittedAt)?.toLocaleString()}
                     </p>
                   </div>
                 </div>
 
-                <div className="flex flex-col sm:flex-row gap-3">
-                  <button
-                    disabled
-                    className="flex-1 py-3 px-4 bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500 rounded-xl font-bold cursor-not-allowed opacity-60"
-                  >
-                    Submission Locked
-                  </button>
-                </div>
+                {canReplace ? (
+                  !isReplacing ? (
+                    <div className="flex flex-col sm:flex-row gap-3">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectedFile(null);
+                          setIsReplacing(true);
+                        }}
+                        className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-200 dark:shadow-none flex items-center justify-center gap-2"
+                      >
+                        Replace my submission
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      <p className="text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 p-3 rounded-lg border border-amber-200 dark:border-amber-800/40">
+                        Replacing deletes your current file. If the upload fails, upload again before the deadline.
+                      </p>
+
+                      <label className="block">
+                        <div className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-xl transition-colors cursor-pointer ${
+                          selectedFile ? "border-blue-400 bg-blue-50/50 dark:border-blue-500/40 dark:bg-blue-900/5" : "border-slate-300 hover:border-blue-400 dark:border-slate-700"
+                        }`}>
+                          <div className="space-y-1 text-center">
+                            <Upload className={`mx-auto h-12 w-12 ${selectedFile ? "text-blue-500" : "text-slate-400"}`} />
+                            <div className="flex text-sm text-slate-600 dark:text-slate-400">
+                              <label className="relative cursor-pointer rounded-md font-semibold text-blue-600 hover:text-blue-500">
+                                <span>{selectedFile ? "Change file" : "Upload a file"}</span>
+                                <input type="file" className="sr-only" onChange={handleFileChange} accept=".pdf, .docx, .txt" />
+                              </label>
+                              {!selectedFile && <p className="pl-1">or drag and drop</p>}
+                            </div>
+                            <p className="text-xs text-slate-500">
+                              {selectedFile ? selectedFile.name : "PDF, DOCX or TXT"}
+                            </p>
+                          </div>
+                        </div>
+                      </label>
+
+                      <div className="flex flex-col sm:flex-row gap-3">
+                        <button
+                          type="button"
+                          onClick={handleReplaceSubmit}
+                          disabled={!selectedFile || replacing}
+                          className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-200 dark:shadow-none flex items-center justify-center gap-2"
+                        >
+                          {replacing ? (
+                            <>
+                              <Loader2 className="h-5 w-5 animate-spin" />
+                              Replacing...
+                            </>
+                          ) : (
+                            "Replace and submit"
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedFile(null);
+                            setIsReplacing(false);
+                          }}
+                          disabled={replacing}
+                          className="py-3 px-4 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 rounded-xl font-bold transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )
+                ) : (
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <button
+                      disabled
+                      className="flex-1 py-3 px-4 bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500 rounded-xl font-bold cursor-not-allowed opacity-60"
+                    >
+                      Submission Locked
+                    </button>
+                  </div>
+                )}
 
                 <p className="text-[10px] text-center text-slate-400 dark:text-slate-500 italic">
-                  Only one submission is permitted per student. To correct an error, please contact your instructor.
+                  You can replace your submission until the deadline. After that, contact your instructor.
                 </p>
               </div>
             ) : isOverdue ? (
@@ -179,48 +316,48 @@ export default function StudentAssignmentPage() {
                 The deadline for this assignment has passed. You can no longer submit your work.
               </p>
             ) : (
-              <div className="space-y-6">
-                <p className="text-sm text-blue-700 dark:text-blue-400">
-                  Please upload your work in PDF format. Make sure your file is final before submitting.
-                </p>
+                <div className="space-y-6">
+                  <p className="text-sm text-blue-700 dark:text-blue-400">
+                    Please upload your work in PDF, DOCX or TXT format. Make sure your file is final before submitting.
+                  </p>
 
-                <div className="space-y-4">
-                  <label className="block">
-                    <div className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-xl transition-colors cursor-pointer ${
-                      selectedFile ? "border-blue-400 bg-blue-50/50 dark:border-blue-500/40 dark:bg-blue-900/5" : "border-slate-300 hover:border-blue-400 dark:border-slate-700"
-                    }`}>
-                      <div className="space-y-1 text-center">
-                        <Upload className={`mx-auto h-12 w-12 ${selectedFile ? "text-blue-500" : "text-slate-400"}`} />
-                        <div className="flex text-sm text-slate-600 dark:text-slate-400">
-                          <label className="relative cursor-pointer rounded-md font-semibold text-blue-600 hover:text-blue-500">
-                            <span>{selectedFile ? "Change file" : "Upload a file"}</span>
-                            <input type="file" className="sr-only" onChange={handleFileChange} accept=".pdf" />
-                          </label>
-                          {!selectedFile && <p className="pl-1">or drag and drop</p>}
+                  <div className="space-y-4">
+                    <label className="block">
+                      <div className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 border-dashed rounded-xl transition-colors cursor-pointer ${
+                        selectedFile ? "border-blue-400 bg-blue-50/50 dark:border-blue-500/40 dark:bg-blue-900/5" : "border-slate-300 hover:border-blue-400 dark:border-slate-700"
+                      }`}>
+                        <div className="space-y-1 text-center">
+                          <Upload className={`mx-auto h-12 w-12 ${selectedFile ? "text-blue-500" : "text-slate-400"}`} />
+                          <div className="flex text-sm text-slate-600 dark:text-slate-400">
+                            <label className="relative cursor-pointer rounded-md font-semibold text-blue-600 hover:text-blue-500">
+                              <span>{selectedFile ? "Change file" : "Upload a file"}</span>
+                              <input type="file" className="sr-only" onChange={handleFileChange} accept=".pdf, .docx, .txt" />
+                            </label>
+                            {!selectedFile && <p className="pl-1">or drag and drop</p>}
+                          </div>
+                          <p className="text-xs text-slate-500">
+                            {selectedFile ? selectedFile.name : "PDF, DOCX or TXT"}
+                          </p>
                         </div>
-                        <p className="text-xs text-slate-500">
-                          {selectedFile ? selectedFile.name : "PDF up to 10MB"}
-                        </p>
                       </div>
-                    </div>
-                  </label>
+                    </label>
 
-                  <button
-                    onClick={handleSubmit}
-                    disabled={!selectedFile || submitting}
-                    className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-200 dark:shadow-none flex items-center justify-center gap-2"
-                  >
-                    {submitting ? (
-                      <>
-                        <Loader2 className="h-5 w-5 animate-spin" />
-                        Submitting...
-                      </>
-                    ) : (
-                      "Submit Assignment"
-                    )}
-                  </button>
+                    <button
+                      onClick={handleSubmit}
+                      disabled={!selectedFile || submitting}
+                      className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white rounded-xl font-bold transition-all shadow-lg shadow-blue-200 dark:shadow-none flex items-center justify-center gap-2"
+                    >
+                      {submitting ? (
+                        <>
+                          <Loader2 className="h-5 w-5 animate-spin" />
+                          Submitting...
+                        </>
+                      ) : (
+                        "Submit Assignment"
+                      )}
+                    </button>
+                  </div>
                 </div>
-              </div>
             )}
           </section>
 
@@ -249,7 +386,7 @@ export default function StudentAssignmentPage() {
                 <div>
                   <p className="text-xs text-slate-500 uppercase font-bold tracking-tight">Due Date</p>
                   <p className="text-sm font-semibold text-slate-900 dark:text-white">
-                    {assignment.dueDate ? new Date(assignment.dueDate).toLocaleString() : "No deadline"}
+                    {parsedDueDate ? parsedDueDate.toLocaleString() : "No deadline"}
                   </p>
                 </div>
               </div>

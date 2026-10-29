@@ -2,15 +2,20 @@
 
   import { useParams, useRouter } from "next/navigation";
   import { useState, useMemo, useEffect } from "react";
+  import { useQueryClient } from "@tanstack/react-query";
   import {
     useAssignment,
     useSubmissions,
     useCourseStudents,
-    pollDetectionJob,
+    useDetectionJob,
     useRunPlagiarism,
     Submission,
+    getStoredJobId,
+    setStoredJobId,
+    clearStoredJobId,
   } from "@/features/teacher/api";
   import { SubmissionRow } from "@/components/ui/submission-row";
+  import DetectionProgress from "@/components/ui/detection-progress";
   import { Loader2, ArrowLeft, FileStack, Search, CheckCircle2, Clock, AlertCircle } from "lucide-react";
   import { toast } from "sonner";
 
@@ -22,16 +27,82 @@
     const { data: submissions, isLoading: loadingSubmissions } = useSubmissions(assignmentId);
     const { data: students, isLoading: loadingStudents } = useCourseStudents(courseId);
     const router = useRouter();
+    const queryClient = useQueryClient();
 
     const [searchTerm, setSearchTerm] = useState("");
     const [statusFilter, setStatusFilter] = useState<string>("all");
-    const [isPreparingReport, setIsPreparingReport] = useState(false);
     const [detectionStatus, setDetectionStatus] = useState<DetectionUiStatus>("idle");
     const [latestJobStatus, setLatestJobStatus] = useState<string | null>(null);
+    const [jobId, setJobId] = useState<string | null>(null);
+
     const runPlagiarismMutation = useRunPlagiarism();
+    const { data: job, isError: jobError, error: jobQueryError } = useDetectionJob(jobId);
+
     const submissionCount = submissions?.length ?? 0;
     const canRunPlagiarism = submissionCount >= 2;
-    const isRunningDetection = runPlagiarismMutation.isPending || isPreparingReport;
+    const isRunningDetection = runPlagiarismMutation.isPending || Boolean(jobId);
+
+    useEffect(() => {
+      if (!assignmentId) return;
+      const storedId = getStoredJobId(assignmentId);
+      setJobId(storedId);
+    }, [assignmentId]);
+
+    useEffect(() => {
+      if (!job) return;
+      const status = String(job.status ?? "").toLowerCase();
+
+      if (status === "starting" || status === "processing") {
+        setDetectionStatus("running");
+        setLatestJobStatus(job.status);
+        return;
+      }
+
+      if (status === "completed") {
+        if (job.report_id) {
+          setDetectionStatus("completed");
+          toast.success("Report ready! Redirecting...", { id: "detection-job" });
+          clearStoredJobId(assignmentId);
+          setJobId(null);
+          queryClient.invalidateQueries({ queryKey: ["assignmentReports", assignmentId] });
+          router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report?report=${job.report_id}`);
+        } else {
+          setDetectionStatus("idle");
+          toast.info("Not enough valid submissions to generate a report", { id: "detection-job" });
+          clearStoredJobId(assignmentId);
+          setJobId(null);
+        }
+        return;
+      }
+
+      if (status === "failed") {
+        setDetectionStatus("error");
+        toast.error("Plagiarism detection failed", { id: "detection-job" });
+        clearStoredJobId(assignmentId);
+        setJobId(null);
+      }
+    }, [job, assignmentId, courseId, router, queryClient]);
+
+    useEffect(() => {
+      if (!jobError) return;
+      const message = (
+        jobQueryError instanceof Error
+          ? jobQueryError.message
+          : String(jobQueryError ?? "")
+      ).toLowerCase();
+
+      if (message.includes("not found")) {
+        clearStoredJobId(assignmentId);
+        setJobId(null);
+        setDetectionStatus("idle");
+        toast.error("Plagiarism job not found. Please try again.", { id: "detection-job" });
+      } else {
+        toast.error("Lost connection while checking job status. Refresh to resume.", {
+          id: "detection-job",
+        });
+        setDetectionStatus("error");
+      }
+    }, [jobError, jobQueryError, assignmentId]);
 
     // Debug: Log when students data arrives
     useEffect(() => {
@@ -148,7 +219,7 @@
       );
     }
 
-    const handleRunPlagiarismCheck = async () => {
+    const handleRunPlagiarismCheck = async (force = false) => {
       if (isRunningDetection) {
         return;
       }
@@ -163,56 +234,29 @@
         return;
       }
 
-      const loadingToastId = toast.loading("Starting plagiarism check...");
+      const loadingToastId = toast.loading("Starting plagiarism check...", { id: "detection-job" });
 
       try {
-        console.log("[plagiarism] Starting detection run", { assignmentId, courseId });
-        setIsPreparingReport(true);
         setDetectionStatus("running");
         setLatestJobStatus("starting");
         toast.loading("Submitting plagiarism job...", { id: loadingToastId });
 
-        const job = await runPlagiarismMutation.mutateAsync(assignmentId);
+        const result = await runPlagiarismMutation.mutateAsync({ assignmentId, force });
 
-        if (!job?.job_id) {
+        if (result.reused && result.report_id) {
+          toast.info("No new submissions since the last check. Showing the existing report.", { id: "detection-job" });
+          router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report?report=${result.report_id}`);
+          return;
+        }
+
+        if (!result?.job_id) {
           throw new Error("Detection job did not return a valid job id");
         }
 
-        console.log("[plagiarism] Detection job created", {
-          assignmentId,
-          courseId,
-          jobId: job.job_id,
-          status: job.status,
-        });
-        toast.loading("Running plagiarism detection...", { id: loadingToastId });
-
-        const finalJob = await pollDetectionJob(job.job_id, {
-          onUpdate: (status) => {
-            setLatestJobStatus(status);
-            console.log("[plagiarism] Poll update", {
-              assignmentId,
-              courseId,
-              jobId: job.job_id,
-              status,
-            });
-          },
-        });
-
-        console.log("FINAL JOB:", finalJob);
-
-        setDetectionStatus("completed");
-        console.log("[plagiarism] Detection job completed, navigating to report", {
-          assignmentId,
-          courseId,
-          jobId: finalJob.job_id,
-          status: finalJob.status,
-          reportId: finalJob.report_id,
-        });
-
-        toast.success("Report ready! Redirecting...", { id: loadingToastId });
-
-        console.log("[plagiarism] Redirecting to report page", { assignmentId, courseId });
-        router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report`);
+        setStoredJobId(assignmentId, result.job_id);
+        setJobId(result.job_id);
+        toast.dismiss("detection-job");
+        return;
       } catch (error) {
         setDetectionStatus("error");
         console.error("[plagiarism] Failed to run plagiarism check", {
@@ -222,8 +266,6 @@
         });
         const errorMessage = error instanceof Error ? error.message : "Failed to run plagiarism check";
         toast.error(errorMessage, { id: loadingToastId });
-      } finally {
-        setIsPreparingReport(false);
       }
     };
 
@@ -252,7 +294,22 @@
           <div className="flex items-center gap-6 self-end sm:self-auto">
             <button
               type="button"
-              onClick={handleRunPlagiarismCheck}
+              onClick={() => router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report`)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              View Latest Report
+            </button>
+            <button
+              type="button"
+              onClick={() => router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/history`)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              Report History
+            </button>
+            <button
+              type="button"
+              onClick={(e) => handleRunPlagiarismCheck(e.shiftKey)}
+              title="Shift+click to re-run even if nothing changed"
               disabled={!canRunPlagiarism || isRunningDetection}
               className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-blue-600"
             >
@@ -290,6 +347,10 @@
             </div>
           </div>
         </div>
+
+        {Boolean(jobId) && (
+          <DetectionProgress status={job?.status} createdAt={job?.created_at} />
+        )}
 
         {/* Filters and Search */}
         <div className="flex flex-col md:flex-row gap-4 items-center justify-between">

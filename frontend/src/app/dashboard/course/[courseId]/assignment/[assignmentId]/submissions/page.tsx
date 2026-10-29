@@ -1,19 +1,23 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "@/store/authStore";
 import {
-  fetchAssignmentReports,
-  pollDetectionJob,
   useAssignment,
   useAssignmentClusters,
   useCourseStudents,
+  useDetectionJob,
   useSubmissions,
   useRunPlagiarism,
+  getStoredJobId,
+  setStoredJobId,
+  clearStoredJobId,
 } from "@/features/teacher/api";
 import { SubmissionRow } from "@/components/ui/submission-row";
 import ClusterCard from "@/components/ui/ClusterCard";
+import DetectionProgress from "@/components/ui/detection-progress";
 import { Loader2, ArrowLeft, Users } from "lucide-react";
 import { toast } from "sonner";
 
@@ -23,6 +27,7 @@ export default function AssignmentSubmissionsPage() {
   const { data: submissions, isLoading: loadingSubmissions } = useSubmissions(assignmentId);
   const { data: students } = useCourseStudents(courseId);
   const router = useRouter();
+  const queryClient = useQueryClient();
 
   const { user } = useAuthStore();
   const isTeacher = user?.role === "teacher";
@@ -35,7 +40,62 @@ export default function AssignmentSubmissionsPage() {
     isFetched: hasFetchedClusters,
     refetch: refetchClusters,
   } = useAssignmentClusters(assignmentId);
-  const [isPollingDetection, setIsPollingDetection] = useState(false);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const { data: job, isError: jobError, error: jobQueryError } = useDetectionJob(jobId);
+
+  useEffect(() => {
+    if (!assignmentId) return;
+    setJobId(getStoredJobId(assignmentId));
+  }, [assignmentId]);
+
+  useEffect(() => {
+    if (!job) return;
+    const status = String(job.status ?? "").toLowerCase();
+
+    if (status === "starting" || status === "processing") {
+      return;
+    }
+
+    if (status === "completed") {
+      if (job.report_id) {
+        toast.success("Report ready", { id: "detection-job" });
+        clearStoredJobId(assignmentId);
+        setJobId(null);
+        queryClient.invalidateQueries({ queryKey: ["assignmentReports", assignmentId] });
+        router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report?report=${job.report_id}`);
+      } else {
+        toast.info("Not enough valid submissions to generate a report", { id: "detection-job" });
+        clearStoredJobId(assignmentId);
+        setJobId(null);
+      }
+      return;
+    }
+
+    if (status === "failed") {
+      toast.error("Plagiarism detection failed", { id: "detection-job" });
+      clearStoredJobId(assignmentId);
+      setJobId(null);
+    }
+  }, [job, assignmentId, courseId, router, queryClient]);
+
+  useEffect(() => {
+    if (!jobError) return;
+    const message = (
+      jobQueryError instanceof Error
+        ? jobQueryError.message
+        : String(jobQueryError ?? "")
+    ).toLowerCase();
+
+    if (message.includes("not found")) {
+      clearStoredJobId(assignmentId);
+      setJobId(null);
+      toast.error("Plagiarism job not found. Please try again.", { id: "detection-job" });
+    } else {
+      toast.error("Lost connection while checking job status. Refresh to resume.", {
+        id: "detection-job",
+      });
+    }
+  }, [jobError, jobQueryError, assignmentId]);
 
   if (loadingAssignment || loadingSubmissions) {
     return (
@@ -72,8 +132,10 @@ export default function AssignmentSubmissionsPage() {
       })
   );
 
-  const handleRunPlagiarismCheck = async () => {
-    if (isPollingDetection || runPlagiarismMutation.isPending) {
+  const isRunningDetection = runPlagiarismMutation.isPending || Boolean(jobId);
+
+  const handleRunPlagiarismCheck = async (force = false) => {
+    if (isRunningDetection) {
       return;
     }
 
@@ -82,50 +144,31 @@ export default function AssignmentSubmissionsPage() {
       return;
     }
 
-    const loadingToastId = toast.loading("Processing...");
+    const loadingToastId = toast.loading("Processing...", { id: "detection-job" });
 
     try {
-      setIsPollingDetection(true);
-      const result = await runPlagiarismMutation.mutateAsync(assignmentId);
-      const jobId = result?.job_id;
+      const result = await runPlagiarismMutation.mutateAsync({ assignmentId, force });
 
-      if (!jobId) {
+      if (result.reused && result.report_id) {
+        toast.info("No new submissions since the last check. Showing the existing report.", { id: "detection-job" });
+        router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report?report=${result.report_id}`);
+        return;
+      }
+
+      const newJobId = result?.job_id;
+
+      if (!newJobId) {
         throw new Error("Detection did not return a valid job_id");
       }
 
-      console.log("Job ID:", jobId);
-
-      const job = await pollDetectionJob(jobId, {
-        onUpdate: (status) => {
-          console.log("Job status update:", status);
-        },
-      });
-
-      console.log("FINAL JOB:", job);
-
-      const finalStatus = String(job.status ?? "").toLowerCase();
-      if (finalStatus !== "completed") {
-        throw new Error(`Detection job did not complete successfully. Current status: ${job.status}`);
-      }
-
-      const reports = await fetchAssignmentReports(assignmentId);
-      console.log("[plagiarism] Reports fetched after completion", {
-        assignmentId,
-        reportCount: reports.length,
-        reportId: reports[0]?.report_id,
-      });
-
-      toast.success("Report ready", { id: loadingToastId });
-
-      // console.log("[plagiarism] Navigating to report page", { courseId, assignmentId, jobId: job.job_id });
-
-      router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report`);
+      setStoredJobId(assignmentId, newJobId);
+      setJobId(newJobId);
+      toast.dismiss("detection-job");
+      return;
     } catch (error) {
       console.error("Failed to run plagiarism check:", error);
       const errorMessage = error instanceof Error ? error.message : "Failed to run plagiarism check";
       toast.error(errorMessage, { id: loadingToastId });
-    } finally {
-      setIsPollingDetection(false);
     }
   };
 
@@ -182,11 +225,28 @@ export default function AssignmentSubmissionsPage() {
 
             <button
               type="button"
-              onClick={handleRunPlagiarismCheck}
-              disabled={eligibleForPlagiarismCount < 2 || runPlagiarismMutation.isPending || isPollingDetection}
+              onClick={() => router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/report`)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              View Latest Report
+            </button>
+
+            <button
+              type="button"
+              onClick={() => router.push(`/dashboard/teacher/courses/${courseId}/assignment/${assignmentId}/history`)}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 transition-colors hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              Report History
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => handleRunPlagiarismCheck(e.shiftKey)}
+              title="Shift+click to re-run even if nothing changed"
+              disabled={eligibleForPlagiarismCount < 2 || isRunningDetection}
               className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-400"
             >
-              {runPlagiarismMutation.isPending || isPollingDetection ? (
+              {isRunningDetection ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Processing...
@@ -198,6 +258,10 @@ export default function AssignmentSubmissionsPage() {
           </div>
         )}
       </div>
+
+      {Boolean(jobId) && (
+        <DetectionProgress status={job?.status} createdAt={job?.created_at} />
+      )}
 
       {isClusterError && (
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-300">

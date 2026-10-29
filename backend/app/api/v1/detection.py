@@ -50,6 +50,7 @@ def _require_valid_token(credentials: HTTPAuthorizationCredentials) -> None:
 
 class DetectionRunRequest(BaseModel):
     assignment_id: str
+    force: bool = False
 
 
 @router.post("/run", status_code=status.HTTP_202_ACCEPTED)
@@ -66,12 +67,15 @@ async def run_detection(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail="Detection orchestration service is not available",
             )
-        job = await detection_service.start_detection(payload.assignment_id)
-        background_tasks.add_task(
-            detection_service.run_detection_job,
-            job["job_id"],
-            payload.assignment_id,
+        job = await detection_service.start_detection(
+            payload.assignment_id, payload.force
         )
+        if not job.get("reused"):
+            background_tasks.add_task(
+                detection_service.run_detection_job,
+                job["job_id"],
+                payload.assignment_id,
+            )
         return {"message": "Detection started", "data": job}
     except HTTPException:
         raise
